@@ -1,0 +1,13 @@
+# Samples are prepared by scripts/prepare_l4r_samples.py (switch-bearing frames,
+# relative symlinks into raw/L4R_NLB_fall plus labels.json / source_meta.json).
+name: l4r_nlb
+kind: local
+max_images: 0
+stem_prefixes:
+  - scene_
+prefer_classes: []
+classes:
+  - switch
+# Calibration shared by every frame in a season (used by the night simulation).
+camera_yaml: ${paths.data_dir}/raw/L4R_NLB_fall/camera/camera.yaml
+raw_dir: ${paths.data_dir}/raw/L4R_NLB_fall

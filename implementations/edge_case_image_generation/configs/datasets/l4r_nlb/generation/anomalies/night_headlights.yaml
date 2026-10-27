@@ -1,0 +1,33 @@
+# Global relight: night travel lit only by the train's headlights, which are
+# mounted on the train front BELOW the cab camera (lamps never in frame).
+# Developed in notebooks/04_dark_condition_simulation.ipynb; paste the selected
+# prompt from outputs/l4r_nlb/night/<frame>/prompt_development.json here to
+# use it in batch runs.
+id: night_headlights
+display_name: Night travel under train headlights
+description: night scene lit only by low-mounted train headlights
+annotation_classes:
+  - railway switch
+  - rail track
+edit_mask:
+  mode: full
+# Klein caps its input at 768 px; keep the same size end-to-end.
+max_side: 768
+variations:
+  lamp: [warm halogen, cool white LED]
+  sky: [the sky is uniformly dark with no stars or moon, a faint overcast glow sits just above the horizon]
+methods:
+  instruct:
+    prompt_template: >-
+      Relight this forward-facing train cab photo as the same scene at night.
+      It is a dark night; the only real light is the train's headlights.
+      Two {lamp} headlights are mounted low on the train front, about 1 m above
+      the rails and below the camera, so the lamps are out of frame. Their beams
+      form a bright pool on the ballast and sleepers at the bottom centre of the
+      frame, and the steel rail heads glint along the lit track ahead. Brightness
+      falls off quickly with distance and the lower parts of nearby objects catch
+      more light than their tops. Everything outside the beam fades to near-black;
+      {sky}. Shot on the same cab camera at night: high ISO grain, slightly soft.
+      Keep the exact same viewpoint, framing, track layout, rails, switches,
+      sleepers, signals, poles, vegetation and buildings in the same positions
+      and shapes; add or remove nothing.

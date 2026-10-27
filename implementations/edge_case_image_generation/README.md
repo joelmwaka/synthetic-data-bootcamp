@@ -66,7 +66,59 @@ Optional CLI (same extract as Notebook 0):
 uv run python scripts/extract_mapillary_toy.py
 ```
 
-Other dataset packages: `rdd2022`, `nordland_hf`. Copy `configs/datasets/_template/` to add your own.
+Other dataset packages: `rdd2022`, `nordland_hf`, `l4r_nlb` (Labels4Rail railway frames, see below). Copy `configs/datasets/_template/` to add your own.
+
+### Labels4Rail switch sample preparation
+
+With the fall images, annotations, masks, and camera calibration under
+`data/l4r_nlb/raw/L4R_NLB_fall/`, run:
+
+```bash
+uv run python implementations/edge_case_image_generation/scripts/prepare_l4r_samples.py
+```
+
+Run from the repository root. The script selects 16 switch-bearing frames using
+box prominence, switch count, and a minimum frame-ID gap of 20. It creates
+relative image symlinks under `data/l4r_nlb/samples/`, filename-keyed `labels.json`
+boxes in original-image pixel coordinates, and `source_meta.json` with source
+paths, scene tags, switch attributes, and selection details. A boxed contact sheet
+is saved as `data/l4r_nlb/switch_contact_sheet.jpg`. Raw files stay unchanged, and
+the script refuses to overwrite an existing samples directory.
+
+Boxes are normalized from the two annotation marks; exact duplicates and entries
+without two marks are excluded and counted in the metadata. These are positive
+switch examples named `scene_*` for use as editing seeds, **not** verified empty
+backgrounds or a train/test split. Frame-ID spacing does not guarantee independent
+scenes.
+
+### Labels4Rail night simulation (Notebook 4)
+
+`configs/datasets/l4r_nlb/` defines one global anomaly, `night_headlights`: night
+travel lit only by the train's headlights, which sit **below** the cab camera.
+[Notebook 4](notebooks/04_dark_condition_simulation.ipynb) develops its prompt on
+one frame:
+
+1. **Geometry** — the L4R `camera.yaml` gives a calibrated rail plane (checked by
+   measuring the annotated ego-rail gauge at several distances); Depth Anything is
+   aligned to it on track-mask pixels to get metric depth, and SegFormer masks the sky.
+2. **Physics prior** — a headlight irradiance map (beam lobes, inverse-square falloff,
+   Lambert cosine; no occlusion shadows) and a physically based night render.
+3. **Prompt development** — slot-structured prompts grounded in annotation tags and
+   the computed beam reach; an ablation (naive / named headlights / effect-only /
+   refine-the-prior), physics metrics (`beam_corr`, `phantom_light`, `lit_structure`,
+   `clipped_lit`, darkness) plus a VLM critic, VLM slot rewrites with `task` and
+   `preserve` locked, and a seed-robustness check.
+4. **Labels** — switch boxes carry over and are flagged `visible_at_night` by beam
+   irradiance and preserved local structure.
+
+Outputs go to `outputs/l4r_nlb/night/<frame>/` (`prompt_development.json`, every
+candidate, the selected frame, and `labels_night.json`). Library code:
+`aieng.syn_data.image.generate.night` and `aieng.syn_data.image.judge.night_critic`;
+the shared workflow (scene analysis with a geometry cache, scoring, gates, run
+records) is `aieng.syn_data.image.workflow`. Every candidate the notebook scores is
+also saved to `outputs/l4r_nlb/studio/`, where the
+[Synthetic Data Studio](../../synthetic_data_studio/README.md) app can review, batch,
+and export it. Notebooks 1–3 are not yet configured for railway classes.
 
 ## Hardware + dataset selection
 
@@ -128,5 +180,6 @@ This folder keeps **configs**, **data**, **notebooks**, and **scripts** only.
 - `notebooks/01_sample_data_generation.ipynb` — synthesis loop + fidelity / novelty / usability (multi-signal judge)
 - `notebooks/02_batch_dataset_generation.ipynb` — stratified split, batch synth + judge until a target number of **accepted** images per class (with an attempt budget), export for NB3
 - `notebooks/03_training_and_evaluation.ipynb` — YOLOv8n real-only vs real+synth on held-out real test
+- `notebooks/04_dark_condition_simulation.ipynb` — Labels4Rail night simulation: calibrated headlight physics prior + prompt development with physics metrics and a VLM critic
 
 Supporting docs: `docs/citations.md`, `docs/figures.md`, `docs/anomaly_authoring.md`.

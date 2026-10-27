@@ -75,6 +75,7 @@ edge-case-image-generation = [
     "tqdm>=4.66",
     "transformers>=4.49",
     "ultralytics>=8.3",
+    "streamlit>=1.40",
 ]
 
 synbench = [
@@ -114,7 +115,7 @@ clip = { git = "https://github.com/ultralytics/CLIP.git", rev = "68dce32140994df
 midst-toolkit = { git = "https://github.com/VectorInstitute/midst-toolkit.git", rev = "52e4500a03afc7f36d93abd7591413ff6393f27c" }
 
 [tool.mypy]
-mypy_path = ["aieng-synthetic-data"]
+mypy_path = ["aieng-synthetic-data", "synthetic_data_studio"]
 ignore_missing_imports = true
 install_types = true
 pretty = true
@@ -218,6 +219,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401", "F403", "F811"]
 "*.ipynb" = ["D100", "E402", "B018"]
+"synthetic_data_studio/tests/*.py" = ["D103"]
 
 [tool.nbqa.addopts]
 # Notebooks idiomatically spread imports across cells, use trailing expressions

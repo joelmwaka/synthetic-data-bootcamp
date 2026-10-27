@@ -1,0 +1,11 @@
+id: l4r_nlb
+label: "Labels4Rail L4R_NLB (fall, recovered subset)"
+license: "Creative Commons (per Zenodo record; verify NRKbeta source terms before redistribution)"
+attribution: >-
+  L4R_NLB dataset, HTW Berlin (https://zenodo.org/records/14260575), annotated with
+  Labels4Rails; footage NRKbeta "Nordlandsbanen minute by minute, season by season".
+source_hint: "a real forward-facing train cab camera photograph from the Nordland railway in Norway"
+workshop_anomalies:
+  - night_headlights
+method_by_anomaly:
+  night_headlights: instruct

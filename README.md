@@ -16,6 +16,7 @@ This bootcamp has four main themes. In each one we try to target a known data bo
 - **implementations/**: Materials organized by topic. Each topic directory includes notebooks and a README with guidance.
 - **pyproject.toml**: Project settings and dependency groups for each topic.
 - **aieng-synthetic-data/**: A small core library that backs the notebooks. The notebooks under `implementations/` stay lightweight for learning; this package is installed into the project environments. You can edit it to change or extend the reference implementations.
+- **synthetic_data_studio/**: A Streamlit app for interactive and batch synthetic image generation (select a source frame with its annotations, generate, score, review, and export). It builds on the edge-case image generation pipeline; see its [README](synthetic_data_studio/README.md).
 
 ### Implementations Directory
 

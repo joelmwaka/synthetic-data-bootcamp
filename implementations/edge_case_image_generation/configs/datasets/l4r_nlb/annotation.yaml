@@ -1,0 +1,6 @@
+# Open-vocab detector queries for railway scenes.
+classes:
+  - railway switch
+  - rail track
+  - railway signal
+  - train

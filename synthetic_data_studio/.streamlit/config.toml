@@ -1,0 +1,11 @@
+[server]
+# Bind to localhost only: this machine is shared. Use VS Code port forwarding to open it.
+address = "localhost"
+port = 8501
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
