@@ -16,6 +16,7 @@ from typing import Any
 
 from aieng.syn_data.image.config import load_config
 from aieng.syn_data.image.data.frames import Frame, FrameSource, frame_source_for
+from aieng.syn_data.image.workflow import generators as gens
 from aieng.syn_data.image.workflow import night as wf
 from aieng.syn_data.image.workflow.store import RunStore, studio_root
 from filelock import FileLock, Timeout
@@ -70,6 +71,8 @@ class Engine:
         self.gpu_timeout = gpu_timeout
         self._source: FrameSource | None = None
         self._comparer: Any = None
+        self._comparer_key: tuple[str, ...] | None = None
+        self._comparer_generator: str | None = None
         self._model_lock = threading.Lock()
 
     # --- data ----------------------------------------------------------------
@@ -96,31 +99,60 @@ class Engine:
 
     @property
     def comparer_loaded(self) -> bool:
-        """Whether the Klein pipeline is loaded in this process."""
+        """Whether a generator is loaded in this process."""
         return self._comparer is not None
 
-    def comparer(self) -> Any:
-        """Lazily build the ``MethodComparer`` (Klein loads on first edit)."""
-        if self._comparer is None:
-            from aieng.syn_data.image.compare_methods import MethodComparer  # noqa: PLC0415
+    @property
+    def loaded_generator(self) -> str | None:
+        """Id of the generator whose models are loaded (``None`` if none)."""
+        return self._comparer_generator if self._comparer is not None else None
 
-            self._comparer = MethodComparer.from_config(self.cfg)
+    def _release_comparer(self) -> None:
+        if self._comparer is not None:
+            self._comparer.unload()
+        self._comparer = None
+        self._comparer_key = None
+        self._comparer_generator = None
+        free_cuda()
+
+    def _build_comparer(self, spec: gens.GeneratorSpec) -> Any:
+        from aieng.syn_data.image.compare_methods import MethodComparer  # noqa: PLC0415
+
+        cfg = self.cfg.copy()
+        cfg.generation = gens.effective_generation_cfg(self.cfg.generation, spec)
+        return MethodComparer.from_config(cfg)
+
+    def comparer(self, spec: gens.GeneratorSpec | None = None) -> Any:
+        """``MethodComparer`` for ``spec``; switching models unloads the previous ones.
+
+        Pipelines load lazily on the first edit. Generators that share models
+        (e.g. Klein instruct and Klein img2img) reuse the same comparer.
+        """
+        spec = spec or gens.get_generator(gens.DEFAULT_GENERATOR)
+        key = gens.comparer_key(spec, self.cfg.generation)
+        if self._comparer is not None and key != self._comparer_key:
+            self._release_comparer()
+        if self._comparer is None:
+            self._comparer = self._build_comparer(spec)
+            self._comparer_key = key
+        self._comparer_generator = spec.id
         return self._comparer
 
     def unload(self) -> None:
-        """Drop the Klein pipeline and free GPU memory."""
+        """Drop the loaded generator and free GPU memory."""
         with self._model_lock:
-            if self._comparer is not None:
-                self._comparer.unload()
-                self._comparer = None
-            free_cuda()
+            self._release_comparer()
+
+    def generator_availability(self, generator_id: str) -> gens.Availability:
+        """Whether a generator can run on this machine."""
+        return gens.availability(gens.get_generator(generator_id), api_key_available=vlm_key_available())
 
     # --- workflow ------------------------------------------------------------
 
     def is_analyzed(self, frame: Frame, work_size: tuple[int, int] = wf.DEFAULT_WORK_SIZE) -> bool:
         """Whether geometry for ``frame`` is already cached."""
         key = wf.GeometryCache.key(frame, work_size, wf.model_key(self.cfg))
-        return self.cache.load(frame, key) is not None
+        return self.cache.has(frame, key)
 
     def analyze(
         self,
@@ -174,6 +206,9 @@ class Engine:
         prompt: str,
         slots: dict[str, str] | None,
         seed_offsets: list[int],
+        generator: str = gens.DEFAULT_GENERATOR,
+        params: dict[str, Any] | None = None,
+        negative_prompt: str = "",
         use_vlm: bool = False,
         gates: dict[str, float] | None = None,
         progress: ProgressFn | None = None,
@@ -182,30 +217,55 @@ class Engine:
         """Generate, score, and store one candidate per seed offset."""
         if input_kind not in ("photo", "prior"):
             raise ValueError(f"input_kind must be photo or prior, got {input_kind!r}")
+        spec = gens.get_generator(generator)
+        resolved = spec.resolve_params(params)
+        status = self.generator_availability(spec.id)
+        if not status.usable:
+            raise RuntimeError(f"{spec.title} cannot run here: {status.reason}")
+        negative = negative_prompt if spec.supports_negative else ""
         source_image: Image.Image = frame.load_image() if input_kind == "photo" else analysis.prior
+        conditioning = (
+            gens.conditioning_from_maps(analysis.disparity, analysis.labels) if spec.needs_conditioning else None
+        )
         critic = self.critic(use_vlm)
         out = []
         for offset in seed_offsets:
             if should_stop and should_stop():
                 break
             if progress:
-                progress(f"{frame.frame_id}: generating {label} (seed +{offset})")
-            lock = self._acquire_gpu()
+                progress(f"{frame.frame_id}: generating {label} with {spec.title} (seed +{offset})")
+            lock = None if spec.cloud else self._acquire_gpu()
             try:
                 with self._model_lock:
-                    image = wf.generate_image(
-                        self.comparer(),
+                    # Cloud editors load no weights; keep any local generator loaded.
+                    comparer = self._build_comparer(spec) if spec.cloud else self.comparer(spec)
+                    image = gens.run_generator(
+                        comparer,
                         self.cfg.generation,
+                        spec,
                         source_image,
                         prompt,
+                        params=resolved,
+                        negative_prompt=negative,
+                        conditioning=conditioning,
                         work_size=analysis.work_size,
                         seed_offset=int(offset),
                     )
             finally:
-                lock.release()
+                if lock is not None:
+                    lock.release()
             if progress:
                 progress(f"{frame.frame_id}: scoring {label} (seed +{offset})")
-            cand = wf.Candidate(label=label, input=input_kind, prompt=prompt, slots=slots, seed_offset=int(offset))
+            cand = wf.Candidate(
+                label=label,
+                input=input_kind,
+                prompt=prompt,
+                slots=slots,
+                seed_offset=int(offset),
+                generator=spec.id,
+                generator_params=dict(resolved),
+                negative_prompt=negative,
+            )
             wf.score_candidate(cand, image, frame, analysis, critic=critic, gates=gates)
             self.store.add_candidate(run_id, cand, image)
             out.append(cand)

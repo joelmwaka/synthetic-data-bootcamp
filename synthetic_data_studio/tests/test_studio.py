@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from aieng.syn_data.image.generate import night
+from aieng.syn_data.image.workflow import generators as gens
 from aieng.syn_data.image.workflow import night as wf
 from PIL import Image
 from studio import batch, jobs, overlays
@@ -105,12 +106,12 @@ def test_resolve_prompt_refreshes_only_the_scene_slot():
     custom = dict(night.physics_prompt_slots({**FACTS, "environment": ["urban"]}))
     custom["beam"] = "tuned beam text"
     spec = batch.build_spec(dataset="d", hardware="h", frame_ids=["a"], mode="custom", slots=custom, input_kind="photo")
-    prompt, slots, input_kind = batch.resolve_prompt(spec, FACTS)
-    assert input_kind == "photo" and slots is not None
+    prompt, slots, input_kind, negative = batch.resolve_prompt(spec, FACTS)
+    assert input_kind == "photo" and slots is not None and negative == ""
     assert "rural" in slots["scene"] and slots["beam"] == "tuned beam text"
     assert prompt == night.compose_prompt(slots)
     spec["refresh_scene"] = False
-    _, kept, _ = batch.resolve_prompt(spec, FACTS)
+    _, kept, _, _ = batch.resolve_prompt(spec, FACTS)
     assert kept is not None and "urban" in kept["scene"]
     preset = batch.build_spec(dataset="d", hardware="h", frame_ids=["a"], mode="preset", preset="hybrid_prior")
     assert batch.resolve_prompt(preset, FACTS)[2] == "prior"
@@ -134,6 +135,9 @@ class _FakeEngine:
         self.store = _FakeStore()
         self.fail = set(fail)
 
+    def generator_availability(self, generator_id):
+        return gens.Availability("blocked" if generator_id == "qwen_image_edit" else "ready", "test")
+
     def frame(self, frame_id):
         if frame_id in self.fail:
             raise KeyError(frame_id)
@@ -143,6 +147,7 @@ class _FakeEngine:
         return SimpleNamespace(facts=FACTS, meta=lambda: {})
 
     def generate(self, run_id, frame, analysis, *, seed_offsets, should_stop, **kwargs):
+        self.generate_kwargs = kwargs
         out = []
         for i, seed in enumerate(seed_offsets):
             if should_stop():
@@ -222,3 +227,63 @@ def test_heartbeat_staleness(tmp_path):
     queue.heartbeat(5)
     time.sleep(0.05)
     assert queue.live_workers(stale_after=0.01) == []
+
+
+def test_build_spec_records_generator_params_and_plain_prompts():
+    spec = batch.build_spec(
+        dataset="d",
+        hardware="h",
+        frame_ids=["a"],
+        mode="custom",
+        prompt="night caption",
+        negative_prompt="daylight",
+        generator="sd15_controlnet",
+        params={"strength": 2.0},
+        input_kind="photo",
+    )
+    assert spec["generator"] == "sd15_controlnet" and spec["params"]["strength"] == 0.95
+    assert spec["params"]["steps"] == 30 and spec["negative_prompt"] == "daylight"
+    assert batch.resolve_prompt(spec, FACTS) == ("night caption", None, "photo", "daylight")
+    klein = batch.build_spec(
+        dataset="d",
+        hardware="h",
+        frame_ids=["a"],
+        mode="custom",
+        prompt="p",
+        negative_prompt="ignored",
+    )
+    assert klein["generator"] == "klein4b_instruct" and klein["negative_prompt"] == ""
+    preset = batch.build_spec(dataset="d", hardware="h", frame_ids=["a"], mode="preset", preset="caption")
+    assert batch.resolve_prompt(preset, FACTS)[3] == wf.CAPTION_NEGATIVE
+    with pytest.raises(KeyError):
+        batch.build_spec(dataset="d", hardware="h", frame_ids=["a"], mode="preset", preset="naive", generator="x")
+    with pytest.raises(ValueError, match="unknown params"):
+        batch.build_spec(dataset="d", hardware="h", frame_ids=["a"], mode="preset", preset="naive", params={"bogus": 1})
+    json.dumps(spec, allow_nan=False)
+
+
+def test_run_job_passes_generator_and_fails_fast_when_unavailable():
+    spec = batch.build_spec(
+        dataset="d",
+        hardware="h",
+        frame_ids=["a"],
+        mode="preset",
+        preset="caption",
+        generator="sd15_inpaint",
+        params={"strength": 0.5},
+    )
+    engine = _FakeEngine()
+    batch.run_job(1, spec, engine, report=lambda p: None, should_cancel=lambda: False)
+    assert engine.generate_kwargs["generator"] == "sd15_inpaint"
+    assert engine.generate_kwargs["params"]["strength"] == 0.5
+    assert engine.generate_kwargs["negative_prompt"] == wf.CAPTION_NEGATIVE
+    blocked = batch.build_spec(
+        dataset="d",
+        hardware="h",
+        frame_ids=["a", "b"],
+        mode="preset",
+        preset="naive",
+        generator="qwen_image_edit",
+    )
+    with pytest.raises(RuntimeError, match="cannot run here"):
+        batch.run_job(2, blocked, _FakeEngine(), report=lambda p: None, should_cancel=lambda: False)

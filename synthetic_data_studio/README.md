@@ -28,8 +28,8 @@ uv run streamlit run app.py
 ```
 
 The server binds to `localhost:8501` only (this machine is shared). Open it through
-VS Code port forwarding. A GPU is needed for generation (an L4 works: Klein loads in
-about a minute, each edit then takes about 20 s).
+VS Code port forwarding. A GPU is needed for the local generators (see
+[Generators](#generators)).
 
 **Data:** Labels4Rail frames are read directly from
 `implementations/edge_case_image_generation/data/l4r_nlb/raw/L4R_NLB_fall/`
@@ -46,10 +46,50 @@ physics metrics only; keys are never shown in the UI.
 |---|---|
 | **Browse** | Filter frames by scene tags (environment, weather, light, time of day, layout), labels and box count; thumbnail grid; select a frame. |
 | **Inspect** | Overlays for switch boxes, track polylines, track mask, and the rail-plane horizon; tag and label tables; calibration check (ego-rail gauge); scene analysis (depth, sky/ground/objects, metric distance); headlight irradiance and the physics-prior render; adjustable headlight rig. |
-| **Generate** | Load a prompt preset, edit the slot-structured prompt (`task` and `preserve` locked), choose the input (physics prior or photo) and seeds, generate, and compare candidates by rank, metrics, gate result and VLM critique. Ask the VLM to rewrite the slots from the run's review history and load the rewrite back into the editor. |
+| **Generate** | Pick a generator and its parameters, load a prompt preset (or the generator's recommended one), edit the slot-structured prompt (`task` and `preserve` locked) or a plain prompt plus negative prompt, choose the input (physics prior or photo) and seeds, generate, and compare candidates by rank, metrics, gate result and VLM critique. "Reuse these settings" restores a candidate's generator, parameters and prompt. Ask the VLM to rewrite the slots from the run's review history. |
 | **Review** | Side-by-side source, physics map and candidate; per-box "visible at night" flags; accept or reject with a note. |
-| **Batch** | Queue a preset or a reviewed candidate's prompt over many frames (from the Browse filter, frames with boxes, or a manual pick), with seeds, accept gates, optional VLM scoring and optional auto-accept. Start the worker and follow progress; cancel jobs. |
+| **Batch** | Queue a preset or a reviewed candidate's prompt (and generator) over many frames (from the Browse filter, frames with boxes, or a manual pick), with seeds, accept gates, optional VLM scoring and optional auto-accept. Start the worker and follow progress; cancel jobs. |
 | **Runs & export** | All runs with decision counts; open a run for review; export accepted candidates to a new folder with `images/`, `labels.json` and `provenance.json`, and download it as a zip. |
+
+## Generators
+
+Pick the image model on the Generate and Batch pages. Each generator is defined in
+`aieng.syn_data.image.workflow.generators` (method, model ids, tunable parameters,
+prompt style, requirements); the choice and its parameters are stored with every
+candidate and in export provenance.
+
+| Generator | Models | Prompt style | Notes |
+|---|---|---|---|
+| FLUX.2 Klein 4B — instruct edit (default) | `FLUX.2-klein-4B` | long instruction | ~15 GB weights; ~1 min load, then ~20–40 s per edit on an L4. |
+| FLUX.2 Klein 4B — full-frame img2img | same weights (inpaint pipeline, full mask) | long instruction | `strength` sets how much of the input is re-noised. |
+| SD 1.5 + ControlNet (depth + seg) | SD 1.5, `sd-controlnet-depth`, `sd-controlnet-seg` | caption + negative (77 CLIP tokens) | Geometry held by the scene's depth map and ADE20K segmentation. |
+| SD 1.5 inpainting — full-frame | `stable-diffusion-inpainting` | caption + negative (77 CLIP tokens) | No structural control; can move or invent content. |
+| InstructPix2Pix | `instruct-pix2pix` | short command (77 CLIP tokens) | Runs at 512 px. |
+| Qwen-Image-Edit (~20B) | `Qwen-Image-Edit` | long instruction | Needs ≥64 GB of GPU memory — blocked on a single L4. |
+| Nano Banana 2 (cloud) | `gemini-3.1-flash-image` via the Vector proxy | long instruction | Needs `OPENAI_API_KEY`; the frame is sent to the API; not seed-reproducible. |
+
+The picker shows 🟢 ready (weights cached), 🟡 downloads weights on first use, or
+⛔ cannot run here (with the reason). Switching between local generators unloads
+the previous one; generators sharing weights (the two Klein options) reuse them.
+For SD 1.5 generators the page counts CLIP tokens and warns when the prompt is cut
+off; use the `caption` or `short_instruction` presets.
+
+Measured on frame `nlb_fall_000419` (L4, recommended preset, seed 0; physics score
+from `selection_score`, higher is better; gates as in `DEFAULT_GATES`):
+
+| Generator | Input | Physics score | Gates |
+|---|---|---|---|
+| Klein 4B full-frame img2img (strength 0.75) | physics prior | 0.81 | pass |
+| Klein 4B instruct | physics prior | 0.72 | pass |
+| SD 1.5 inpainting (strength 0.5) | physics prior | 0.71 | pass, but changes the track layout |
+| SD 1.5 + ControlNet (strength 0.5) | physics prior | 0.70 | pass |
+| InstructPix2Pix | physics prior | 0.66 | pass, close to the prior |
+| SD 1.5 + ControlNet (strength 0.75) | dusk photo | 0.11 | fail — stays dusk-bright |
+| SD 1.5 inpainting (strength 0.7) | dusk photo | 0.02 | fail — invents a lit train |
+
+SD 1.5 cannot take a dusk photo to real night darkness, so its presets edit the
+physics render instead. One frame and one seed are not a benchmark; compare
+generators on your own frames before choosing one for a batch.
 
 ## How it is built
 
@@ -101,8 +141,9 @@ unless you choose to keep them (flagged `visible_at_night: false`).
 Model work (depth and segmentation on a geometry-cache miss, and Klein edits) runs
 under a cross-process lock (`gpu.lock`), so the app and a worker never use the GPU at
 the same time. If the worker holds it, interactive generation reports "GPU busy".
-Each process that generates keeps its own copy of Klein in memory. Starting a worker
-from the Batch page unloads the app's copy first. Use **Unload generator** in the
+Each process that generates keeps its own copy of the active generator in memory.
+Starting a worker from the Batch page unloads the app's copy first. Cloud generation
+doesn't take the GPU lock or unload a local generator. Use **Unload generator** in the
 sidebar to free memory manually. The worker unloads after every job.
 
 ### Batch worker
@@ -134,6 +175,8 @@ tests live in `aieng-synthetic-data/tests/test_image_workflow.py`.
 ## Limitations
 
 - One synthesis task (night headlights), and only for calibrated Labels4Rail frames.
+- Qwen-Image-Edit cannot run on a single L4; Nano Banana 2 needs an API key and is not
+  covered by GPU tests here.
 - Boxes can be marked visible or dark, but not redrawn.
 - Single-user design: one GPU lock and one shared output store per dataset.
 - The physics prior has no occlusion shadows, and the scoring weights and gates are

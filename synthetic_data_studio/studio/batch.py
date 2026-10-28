@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from aieng.syn_data.image.generate import night
+from aieng.syn_data.image.workflow import generators as gens
 from aieng.syn_data.image.workflow import night as wf
 
 from studio.engine import Engine
@@ -23,6 +24,10 @@ def build_spec(
     mode: str,
     preset: str | None = None,
     slots: dict[str, str] | None = None,
+    prompt: str | None = None,
+    negative_prompt: str = "",
+    generator: str = gens.DEFAULT_GENERATOR,
+    params: dict[str, Any] | None = None,
     input_kind: str = "prior",
     refresh_scene: bool = True,
     seed_offsets: list[int] | None = None,
@@ -39,9 +44,12 @@ def build_spec(
     if mode == "preset" and preset not in wf.PRESET_DESCRIPTIONS:
         raise ValueError(f"Unknown preset {preset!r}")
     if mode == "custom":
-        if not slots:
-            raise ValueError("Custom mode needs prompt slots")
-        night.compose_prompt(slots)
+        if slots:
+            night.compose_prompt(slots)
+        elif not (prompt and prompt.strip()):
+            raise ValueError("Custom mode needs prompt slots or a prompt")
+    spec = gens.get_generator(generator)
+    resolved = spec.resolve_params(params)
     if input_kind not in ("photo", "prior"):
         raise ValueError("input_kind must be photo or prior")
     offsets = sorted({int(s) for s in (seed_offsets or [0])})
@@ -55,6 +63,10 @@ def build_spec(
         "mode": mode,
         "preset": preset,
         "slots": slots,
+        "prompt": None if slots else (prompt or None),
+        "negative_prompt": negative_prompt if spec.supports_negative else "",
+        "generator": spec.id,
+        "params": resolved,
         "input_kind": input_kind,
         "refresh_scene": bool(refresh_scene),
         "seed_offsets": offsets,
@@ -65,19 +77,23 @@ def build_spec(
     }
 
 
-def resolve_prompt(spec: dict[str, Any], facts: dict[str, Any]) -> tuple[str, dict[str, str] | None, str]:
-    """Return ``(prompt, slots, input_kind)`` for one frame.
+def resolve_prompt(spec: dict[str, Any], facts: dict[str, Any]) -> tuple[str, dict[str, str] | None, str, str]:
+    """Return ``(prompt, slots, input_kind, negative_prompt)`` for one frame.
 
     Presets are rebuilt from each frame's facts. Custom slots are reused, with
-    the purely factual ``scene`` slot refreshed per frame when requested.
+    the purely factual ``scene`` slot refreshed per frame when requested; a
+    custom plain prompt is used as is.
     """
     if spec["mode"] == "preset":
         preset = wf.prompt_presets(facts)[spec["preset"]]
-        return preset["prompt"], preset["slots"], preset["input"]
+        return preset["prompt"], preset["slots"], preset["input"], preset["negative_prompt"]
+    negative = spec.get("negative_prompt") or ""
+    if not spec.get("slots"):
+        return spec["prompt"], None, spec["input_kind"], negative
     slots = dict(spec["slots"])
     if spec.get("refresh_scene", True) and "scene" in slots:
         slots["scene"] = night.physics_prompt_slots(facts)["scene"]
-    return night.compose_prompt(slots), slots, spec["input_kind"]
+    return night.compose_prompt(slots), slots, spec["input_kind"], negative
 
 
 def run_job(
@@ -105,6 +121,11 @@ def run_job(
         progress["message"] = text
         report(progress)
 
+    generator = spec.get("generator", gens.DEFAULT_GENERATOR)
+    status = engine.generator_availability(generator)
+    if not status.usable:
+        raise RuntimeError(f"Generator {generator} cannot run here: {status.reason}")
+
     for frame_id in spec["frame_ids"]:
         if should_cancel():
             progress["cancelled"] = True
@@ -113,7 +134,7 @@ def run_job(
             frame = engine.frame(frame_id)
             _msg(f"{frame_id}: analysing scene")
             analysis = engine.analyze(frame)
-            prompt, slots, input_kind = resolve_prompt(spec, analysis.facts)
+            prompt, slots, input_kind, negative = resolve_prompt(spec, analysis.facts)
             run_id = engine.store.create_run(
                 frame,
                 kind="batch",
@@ -130,6 +151,9 @@ def run_job(
                 prompt=prompt,
                 slots=slots,
                 seed_offsets=spec["seed_offsets"],
+                generator=spec.get("generator", gens.DEFAULT_GENERATOR),
+                params=spec.get("params"),
+                negative_prompt=negative,
                 use_vlm=spec["use_vlm"],
                 gates=spec["gates"],
                 progress=_msg,

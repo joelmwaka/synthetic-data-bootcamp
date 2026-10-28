@@ -64,6 +64,8 @@ class VlmGenerateConfig:
     aspect_ratio: str | None = None
     size: str = "1024x1024"
     max_side: int = 1024
+    # Replaces the default street-photo preamble of edit prompts when set.
+    edit_preamble: str | None = None
 
 
 def require_vlm_api_enabled(flag: Any) -> None:
@@ -116,11 +118,15 @@ def generate_with_vlm(
     return _generate_openai(prompt, seed_image=seed_image, model=model, cfg=cfg)
 
 
-def _edit_prompt(prompt: str) -> str:
+_DEFAULT_EDIT_PREAMBLE = (
+    "Edit this street photograph. Keep camera angle, layout, vehicles, "
+    "buildings, and lighting as similar as possible."
+)
+
+
+def _edit_prompt(prompt: str, preamble: str | None = None) -> str:
     return (
-        "Edit this street photograph. Keep camera angle, layout, vehicles, "
-        "buildings, and lighting as similar as possible. "
-        f"Instruction: {prompt.strip()}"
+        f"{(preamble or _DEFAULT_EDIT_PREAMBLE).strip()} Instruction: {prompt.strip()}"
     )
 
 
@@ -212,7 +218,7 @@ def _generate_gemini(
                 mime_type="image/png",
             ),
         )
-        text = _edit_prompt(prompt)
+        text = _edit_prompt(prompt, cfg.edit_preamble)
     else:
         text = _gen_prompt(prompt)
     parts.append(types.Part.from_text(text=text))
@@ -255,7 +261,7 @@ def _generate_openai(
         result = client.images.edit(
             model=model,
             image=buf,
-            prompt=_edit_prompt(prompt),
+            prompt=_edit_prompt(prompt, cfg.edit_preamble),
             size=cfg.size,
         )
     else:
@@ -279,7 +285,11 @@ def _generate_vector_proxy(
         base_url=resolve_api_base_url(cfg.api_base_url, role="VLM"),
         role="VLM",
     )
-    text = _edit_prompt(prompt) if seed_image is not None else _gen_prompt(prompt)
+    text = (
+        _edit_prompt(prompt, cfg.edit_preamble)
+        if seed_image is not None
+        else _gen_prompt(prompt)
+    )
 
     # Prefer chat multimodal when the proxy supports image out; fall back to Images API.
     messages: list[dict[str, Any]]
@@ -300,11 +310,14 @@ def _generate_vector_proxy(
     else:
         messages = [{"role": "user", "content": text}]
 
+    extra_body: dict[str, Any] = {"response_modalities": ["TEXT", "IMAGE"]}
+    if cfg.aspect_ratio:
+        extra_body["image_config"] = {"aspect_ratio": cfg.aspect_ratio}
     try:
         response = client.chat.completions.create(
             model=model,
             messages=messages,
-            extra_body={"response_modalities": ["TEXT", "IMAGE"]},
+            extra_body=extra_body,
         )
         image = _extract_chat_image(response)
         if image is not None:

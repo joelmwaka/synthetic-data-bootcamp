@@ -10,6 +10,7 @@ import streamlit as st
 from aieng.syn_data.image.config import configs_dir, list_dataset_names
 from aieng.syn_data.image.data.frames import CAP_CALIBRATION, Frame
 from aieng.syn_data.image.data.loader import project_root
+from aieng.syn_data.image.workflow import generators as gens
 from aieng.syn_data.image.workflow import night as wf
 from PIL import Image
 
@@ -93,12 +94,13 @@ def sidebar() -> Engine:
         else:
             st.caption("VLM critic: no API key in the environment — physics metrics only")
         if engine.comparer_loaded:
-            st.caption("Generator: FLUX.2 Klein loaded in this app")
+            loaded = gens.GENERATORS.get(engine.loaded_generator or "")
+            st.caption(f"Generator loaded: {loaded.title if loaded else engine.loaded_generator}")
             if st.button("Unload generator", help="Free GPU/CPU memory, e.g. before starting a batch worker"):
                 engine.unload()
                 st.rerun()
         else:
-            st.caption("Generator: not loaded (loads on first generation, ~1 min)")
+            st.caption("Generator: not loaded (loads on first generation)")
         st.caption(f"Outputs: `{engine.root.relative_to(impl_root())}`")
     return engine
 
@@ -197,6 +199,7 @@ def metrics_row(cand: wf.Candidate, pool: list[wf.Candidate]) -> dict[str, Any]:
     m = cand.metrics
     return {
         "label": cand.label,
+        "generator": cand.generator,
         "seed": cand.seed_offset,
         "input": cand.input,
         "rank": round(wf.rank_key(cand, pool), 3),
@@ -211,3 +214,77 @@ def metrics_row(cand: wf.Candidate, pool: list[wf.Candidate]) -> dict[str, Any]:
         "decision": cand.decision,
         "id": cand.candidate_id,
     }
+
+
+STATUS_ICON = {"ready": "🟢", "download": "🟡", "blocked": "⛔"}
+
+
+def generator_label(generator_id: str, engine: Engine) -> str:
+    """Selectbox label: status icon + title."""
+    status = engine.generator_availability(generator_id)
+    return f"{STATUS_ICON[status.status]} {gens.get_generator(generator_id).title}"
+
+
+def generator_controls(
+    engine: Engine,
+    key: str,
+    *,
+    default: str = gens.DEFAULT_GENERATOR,
+) -> tuple[gens.GeneratorSpec, dict[str, float | int], gens.Availability]:
+    """Render the generator picker, availability notes, and parameter widgets.
+
+    Widget state lives under ``key`` so each page/frame keeps its own choice.
+    """
+    ids = list(gens.GENERATORS)
+    gen_key = f"{key}_generator"
+    if st.session_state.get(gen_key) not in ids:
+        st.session_state[gen_key] = default if default in ids else gens.DEFAULT_GENERATOR
+    spec = gens.get_generator(
+        st.selectbox(
+            "Generator",
+            ids,
+            key=gen_key,
+            format_func=lambda gid: generator_label(gid, engine),
+            help="🟢 ready · 🟡 downloads weights on first use · ⛔ cannot run here",
+        ),
+    )
+    status = engine.generator_availability(spec.id)
+    notes = [spec.summary]
+    if spec.max_prompt_tokens:
+        notes.append(f"Text encoder reads at most {spec.max_prompt_tokens} CLIP tokens.")
+    if not spec.seeded:
+        notes.append("Results are not seed-reproducible.")
+    notes.append(f"Recommended prompt preset: `{spec.recommended_preset}`.")
+    if status.status == "blocked":
+        st.error(status.reason)
+    elif status.status == "download":
+        st.warning(status.reason)
+    else:
+        st.caption(status.reason)
+    st.caption(" ".join(notes))
+    params: dict[str, float | int] = {}
+    if spec.params:
+        cols = st.columns(min(len(spec.params), 3))
+        for i, param in enumerate(spec.params):
+            widget_key = f"{key}_{spec.id}_{param.name}"
+            if widget_key not in st.session_state:
+                st.session_state[widget_key] = param.coerce(param.default)
+            if param.kind == "int":
+                params[param.name] = cols[i % len(cols)].number_input(
+                    param.label,
+                    int(param.min),
+                    int(param.max),
+                    step=int(param.step),
+                    key=widget_key,
+                    help=param.help or None,
+                )
+            else:
+                params[param.name] = cols[i % len(cols)].slider(
+                    param.label,
+                    float(param.min),
+                    float(param.max),
+                    step=float(param.step),
+                    key=widget_key,
+                    help=param.help or None,
+                )
+    return spec, spec.resolve_params(params), status

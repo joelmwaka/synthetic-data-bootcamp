@@ -34,6 +34,7 @@ for run in runs:
             "rejected": decisions.count("rejected"),
             "pending": decisions.count("pending"),
             "passed gates": sum(bool(c.gate.get("passed")) for c in cands),
+            "generators": ", ".join(sorted({c.generator for c in cands})),
             "best physics": round(max((c.physics_score for c in cands), default=0.0), 3),
             "created": run.get("created_at", ""),
         },
@@ -54,7 +55,10 @@ if shown:
     for i, cand in enumerate(cands):
         with cols[i % 4]:
             st.image(frame_thumb(engine.store.image_path(pick, cand), 320), width="stretch")
-            st.caption(f"{cand.decision} · {cand.label} · seed +{cand.seed_offset} · physics {cand.physics_score:.3f}")
+            st.caption(
+                f"{cand.decision} · {cand.label} · {cand.generator} · seed +{cand.seed_offset} · "
+                f"physics {cand.physics_score:.3f}",
+            )
     if cands and st.button("Review this run"):
         state["review_run"] = pick
         st.switch_page("views/review.py")

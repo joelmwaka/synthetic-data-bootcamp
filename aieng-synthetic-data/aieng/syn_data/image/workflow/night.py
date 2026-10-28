@@ -28,6 +28,8 @@ from aieng.syn_data.image.generate import night
 
 
 DEFAULT_WORK_SIZE = (768, 432)
+# Bump when the cached arrays change (v2 adds the segmentation label map).
+CACHE_VERSION = "v2"
 
 DEFAULT_GATES: dict[str, float] = {
     "min_beam_corr": 0.6,
@@ -43,7 +45,14 @@ PRESET_DESCRIPTIONS = {
     "named_source": "Physically accurate text that names the headlights (tends to draw them).",
     "effect_only": "Same physics, describes only where the light lands.",
     "hybrid_prior": "Effect-only prompt that refines the physics render.",
+    "caption": "Short caption + negative prompt that refines the physics render (SD1.5 generators, 77 CLIP tokens).",
+    "short_instruction": "One-line edit command on the physics render (InstructPix2Pix, 77 CLIP tokens).",
 }
+
+CAPTION_NEGATIVE = (
+    "daylight, sunlight, blue sky, sunset, visible headlights, oncoming train, street lights, "
+    "lens flare, stars, moon, cartoon, painting, blurry, distorted rails"
+)
 
 
 def to_jsonable(obj: Any) -> Any:
@@ -77,6 +86,7 @@ class SceneAnalysis:
     work_camera: night.RailCamera
     geometry: night.SceneGeometry
     disparity: np.ndarray
+    labels: np.ndarray  # ADE20K label map on the work grid (0-based, SegFormer ids)
     rails: np.ndarray
     rig: night.HeadlightRig
     look: night.NightLook
@@ -120,16 +130,20 @@ class GeometryCache:
     def key(frame: Frame, work_size: tuple[int, int], model_key: str) -> str:
         """Cache key from frame identity, analysis grid, and model ids."""
         stat = frame.image_path.stat()
-        raw = f"{frame.dataset}|{frame.frame_id}|{stat.st_size}|{work_size}|{model_key}"
+        raw = f"{CACHE_VERSION}|{frame.dataset}|{frame.frame_id}|{stat.st_size}|{work_size}|{model_key}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     def _path(self, frame: Frame, key: str) -> Path:
         return self.root / frame.frame_id / f"{key}.npz"
 
+    def has(self, frame: Frame, key: str) -> bool:
+        """Whether an entry exists (without reading it)."""
+        return self._path(frame, key).is_file()
+
     def load(
         self, frame: Frame, key: str
-    ) -> tuple[night.SceneGeometry, np.ndarray] | None:
-        """Return cached ``(geometry, disparity)`` or ``None``."""
+    ) -> tuple[night.SceneGeometry, np.ndarray, np.ndarray] | None:
+        """Return cached ``(geometry, disparity, labels)`` or ``None``."""
         path = self._path(frame, key)
         if not path.is_file():
             return None
@@ -144,7 +158,7 @@ class GeometryCache:
                     k: float("nan") if v is None else float(v) for k, v in fit.items()
                 },
             )
-            return geometry, data["disparity"]
+            return geometry, data["disparity"], data["labels"].astype(np.int32)
 
     def save(
         self,
@@ -152,8 +166,9 @@ class GeometryCache:
         key: str,
         geometry: night.SceneGeometry,
         disparity: np.ndarray,
+        labels: np.ndarray,
     ) -> Path:
-        """Write ``(geometry, disparity)`` atomically."""
+        """Write ``(geometry, disparity, labels)`` atomically."""
         path = self._path(frame, key)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.npz")
@@ -164,6 +179,7 @@ class GeometryCache:
             ground=geometry.ground,
             sky=geometry.sky,
             disparity=disparity.astype(np.float32),
+            labels=labels.astype(np.int16),
             depth_fit=json.dumps(to_jsonable(geometry.depth_fit)),
         )
         tmp.replace(path)
@@ -196,8 +212,8 @@ def compute_geometry(
     *,
     depth_model: Any,
     segmenter: Any,
-) -> tuple[night.SceneGeometry, np.ndarray]:
-    """Run depth + segmentation and build calibrated geometry for a frame."""
+) -> tuple[night.SceneGeometry, np.ndarray, np.ndarray]:
+    """Run depth + segmentation; return ``(geometry, disparity, labels)``."""
     work_image = frame.load_image().resize(work_size, Image.Resampling.LANCZOS)
     disparity = depth_model.predict(work_image).depth_map
     segmentation = segmenter.predict(work_image)
@@ -213,7 +229,7 @@ def compute_geometry(
         track,
         sky_mask=np.isin(segmentation.label_map, sky_ids),
     )
-    return geometry, disparity
+    return geometry, disparity, np.asarray(segmentation.label_map, dtype=np.int32)
 
 
 def light_scene(
@@ -267,13 +283,13 @@ def analyze_frame(
         if load_models is None:
             raise RuntimeError("Geometry not cached and no model loader given")
         depth_model, segmenter = load_models()
-        geometry, disparity = compute_geometry(
+        geometry, disparity, labels = compute_geometry(
             frame, camera, work_size, depth_model=depth_model, segmenter=segmenter
         )
         if cache:
-            cache.save(frame, key, geometry, disparity)
+            cache.save(frame, key, geometry, disparity, labels)
     else:
-        geometry, disparity = cached
+        geometry, disparity, labels = cached
     annotation = frame.annotation or {}
     rig = night.HeadlightRig(centre_x_m=night.ego_centre_x(annotation, camera))
     if rig_overrides:
@@ -290,6 +306,7 @@ def analyze_frame(
         work_camera=camera.resized(*work_size),
         geometry=geometry,
         disparity=disparity,
+        labels=labels,
         rails=rails,
         rig=rig,
         look=look,
@@ -303,8 +320,18 @@ def analyze_frame(
 # --- prompts and generation ----------------------------------------------------
 
 
+def caption_prompt(facts: dict[str, Any]) -> str:
+    """Target-image caption for CLIP-conditioned SD1.5 generators (fits 77 tokens)."""
+    env = " and ".join(facts.get("environment") or []) or "rural"
+    return (
+        f"night photo from a train driver's cab, dark {env} railway at night, the only light is a "
+        "pool of warm headlight light on the track ahead, light fades with distance, rails glinting, "
+        "black sky, high ISO grain, photorealistic"
+    )
+
+
 def prompt_presets(facts: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Ablation presets: ``{name: {"input", "slots", "prompt"}}``."""
+    """Presets: ``{name: {"input", "slots", "prompt", "negative_prompt"}}``."""
     presets: dict[str, dict[str, Any]] = {
         "naive": {"input": "photo", "slots": None, "prompt": night.naive_prompt()},
         "named_source": {
@@ -313,10 +340,24 @@ def prompt_presets(facts: dict[str, Any]) -> dict[str, dict[str, Any]]:
         },
         "effect_only": {"input": "photo", "slots": night.physics_prompt_slots(facts)},
         "hybrid_prior": {"input": "prior", "slots": night.prior_refine_slots(facts)},
+        # SD1.5 cannot reach real night darkness from a dusk photo; starting from the
+        # dark physics render keeps the light layout and lets it add texture.
+        "caption": {
+            "input": "prior",
+            "slots": None,
+            "prompt": caption_prompt(facts),
+            "negative_prompt": CAPTION_NEGATIVE,
+        },
+        "short_instruction": {
+            "input": "prior",
+            "slots": None,
+            "prompt": "make it a dark night lit only by the train's headlights shining on the track ahead",
+        },
     }
     for preset in presets.values():
         if preset["slots"] is not None:
             preset["prompt"] = night.compose_prompt(preset["slots"])
+        preset.setdefault("negative_prompt", "")
     return presets
 
 
@@ -373,6 +414,10 @@ class Candidate:
     box_visible: list[bool] | None = None
     image_file: str = ""
     created_at: str = field(default_factory=utc_now)
+    # Records made before generators were selectable all used Klein 4B instruct.
+    generator: str = "klein4b_instruct"
+    generator_params: dict[str, Any] = field(default_factory=dict)
+    negative_prompt: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe dict."""
@@ -508,6 +553,7 @@ def history_entry(candidate: Candidate) -> dict[str, Any]:
         to_jsonable(
             {
                 "label": candidate.label,
+                "generator": candidate.generator,
                 "input": candidate.input,
                 "metrics": {
                     k: m.get(k)

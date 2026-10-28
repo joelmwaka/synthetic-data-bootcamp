@@ -6,10 +6,19 @@ import streamlit as st
 from aieng.syn_data.image.data.frames import CAP_CALIBRATION
 from aieng.syn_data.image.generate import night
 from aieng.syn_data.image.judge.night_critic import rewrite_prompt
+from aieng.syn_data.image.workflow import generators as gens
 from aieng.syn_data.image.workflow import night as wf
 from studio.engine import GpuBusyError, vlm_key_available
 from studio.overlays import draw_overlay
-from studio.ui import candidate_image, fmt, get_analysis, metrics_row, require_frame, sidebar
+from studio.ui import (
+    candidate_image,
+    fmt,
+    generator_controls,
+    get_analysis,
+    metrics_row,
+    require_frame,
+    sidebar,
+)
 
 
 engine = sidebar()
@@ -37,7 +46,9 @@ fid = frame.frame_id
 presets = wf.prompt_presets(analysis.facts)
 slot_key = {name: f"slot_{fid}_{name}" for name in night.PROMPT_SLOTS}
 raw_key = f"raw_{fid}"
+neg_key = f"neg_{fid}"
 input_key = f"input_{fid}"
+gen_widget = f"gen_{fid}"
 runs_by_frame: dict[str, str] = state.setdefault("run_by_frame", {})
 
 
@@ -50,7 +61,9 @@ def load_preset(name: str) -> None:
         for slot, text in preset["slots"].items():
             state[slot_key[slot]] = text
     state[raw_key] = preset["prompt"]
+    state[neg_key] = preset["negative_prompt"]
     state[f"label_{fid}"] = name
+    state[f"preset_{fid}"] = name
 
 
 if f"mode_{fid}" not in state:
@@ -63,6 +76,31 @@ if pending:
     for slot, text in pending.items():
         state[slot_key[slot]] = text
     state[f"mode_{fid}"] = "slots"
+pending_cand = state.pop(f"pending_candidate_{fid}", None)
+if pending_cand:
+    # Restore generator, parameters and prompt of an earlier candidate.
+    state[f"{gen_widget}_generator"] = pending_cand.generator
+    target = gens.get_generator(pending_cand.generator)
+    for name, value in target.resolve_params(pending_cand.generator_params).items():
+        state[f"{gen_widget}_{target.id}_{name}"] = value
+    state[input_key] = pending_cand.input
+    state[neg_key] = pending_cand.negative_prompt
+    if pending_cand.slots:
+        for slot, text in pending_cand.slots.items():
+            state[slot_key[slot]] = text
+        state[f"mode_{fid}"] = "slots"
+    else:
+        state[raw_key] = pending_cand.prompt
+        state[f"mode_{fid}"] = "raw"
+
+with st.container(border=True):
+    st.markdown("**Generator**")
+    spec, gen_params, gen_status = generator_controls(engine, gen_widget)
+    if state.get(f"preset_{fid}") != spec.recommended_preset and st.button(
+        f"Load recommended preset `{spec.recommended_preset}`",
+    ):
+        load_preset(spec.recommended_preset)
+        st.rerun()
 
 c_img, c_prompt = st.columns([2, 3])
 with c_img:
@@ -81,9 +119,7 @@ with c_prompt:
     preset_name = p1.selectbox(
         "Preset",
         list(presets),
-        index=list(presets).index(state.get(f"label_{fid}", "hybrid_prior"))
-        if state.get(f"label_{fid}") in presets
-        else 3,
+        index=list(presets).index(state[f"preset_{fid}"]) if state.get(f"preset_{fid}") in presets else 3,
         format_func=lambda n: f"{n} — {wf.PRESET_DESCRIPTIONS[n]}",
     )
     if p2.button("Load preset", width="stretch"):
@@ -109,6 +145,19 @@ with c_prompt:
         st.text_area("Prompt", key=raw_key, height=200)
         slots = None
         prompt = state[raw_key]
+    negative = ""
+    if spec.supports_negative:
+        state.setdefault(neg_key, "")
+        negative = st.text_area("Negative prompt", key=neg_key, height=68)
+    if spec.max_prompt_tokens:
+        n_tokens = gens.clip_token_count(prompt)
+        if n_tokens > spec.max_prompt_tokens:
+            st.warning(
+                f"Prompt is {n_tokens} CLIP tokens; {spec.title} reads only the first "
+                f"{spec.max_prompt_tokens}. Shorten it or load the `{spec.recommended_preset}` preset.",
+            )
+        else:
+            st.caption(f"{n_tokens}/{spec.max_prompt_tokens} CLIP tokens")
     with st.expander(f"Composed prompt ({len(prompt.split())} words)"):
         st.write(prompt)
 
@@ -124,7 +173,7 @@ use_vlm = g4.checkbox(
     help=None if vlm_key_available() else "No judge API key in the environment.",
 )
 
-if st.button("Generate", type="primary", disabled=not prompt.strip()):
+if st.button("Generate", type="primary", disabled=not prompt.strip() or not gen_status.usable):
     run_id = runs_by_frame.get(fid)
     if run_id is None:
         run_id = engine.store.create_run(
@@ -136,8 +185,8 @@ if st.button("Generate", type="primary", disabled=not prompt.strip()):
         runs_by_frame[fid] = run_id
     offsets = list(range(int(seed_start), int(seed_start) + int(n_seeds)))
     with st.status("Generating…", expanded=True) as status:
-        if not engine.comparer_loaded:
-            st.write("Loading FLUX.2 Klein (first time ~1 min)…")
+        if not spec.cloud and engine.loaded_generator != spec.id:
+            st.write(f"Loading {spec.title} (downloads weights on first use)…")
         try:
             made = engine.generate(
                 run_id,
@@ -148,12 +197,18 @@ if st.button("Generate", type="primary", disabled=not prompt.strip()):
                 prompt=prompt,
                 slots=slots,
                 seed_offsets=offsets,
+                generator=spec.id,
+                params=gen_params,
+                negative_prompt=negative,
                 use_vlm=use_vlm,
                 progress=st.write,
             )
         except GpuBusyError as exc:
             status.update(label="GPU busy", state="error")
             st.error(str(exc))
+        except Exception as exc:  # noqa: BLE001 - show model/download/OOM failures instead of crashing
+            status.update(label="Generation failed", state="error")
+            st.error(f"{type(exc).__name__}: {exc}")
         else:
             status.update(label=f"Generated {len(made)} candidate(s)", state="complete")
 
@@ -182,18 +237,18 @@ for start in range(0, len(ranked), 3):
                 width="stretch",
             )
             gate = "✅ passes gates" if cand.gate.get("passed") else "⚠️ " + "; ".join(cand.gate.get("reasons", []))
+            gen_spec = gens.GENERATORS.get(cand.generator)
             st.markdown(
                 f"**{cand.label}** · seed +{cand.seed_offset} · {cand.input} · rank "
-                f"{wf.rank_key(cand, pool):.3f}  \n{gate}",
+                f"{wf.rank_key(cand, pool):.3f}  \n{gen_spec.title if gen_spec else cand.generator}  \n{gate}",
             )
             crit = cand.critique or {}
             if crit.get("critique"):
                 st.caption(f"VLM {fmt(cand.vlm_overall, '.1f')}: {crit['critique']}  \nfix → {crit.get('prompt_fix')}")
             elif crit.get("error"):
                 st.caption(f"VLM unscored: {crit['error'][:160]}")
-            if cand.slots and st.button("Edit from this prompt", key=f"use_{cand.candidate_id}"):
-                state[f"pending_slots_{fid}"] = cand.slots
-                state[f"pending_input_{fid}"] = cand.input
+            if gen_spec and st.button("Reuse these settings", key=f"use_{cand.candidate_id}"):
+                state[f"pending_candidate_{fid}"] = cand
                 st.rerun()
 
 st.divider()

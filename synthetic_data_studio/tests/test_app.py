@@ -59,9 +59,13 @@ def test_synthesis_pages_render(page):
     at.switch_page(page).run()
     _no_errors(at)
     if page == "views/generate.py":
-        # Cached geometry → prompt editor with all nine slots, two of them locked.
-        assert len(at.text_area) == 9
-        assert sum(t.disabled for t in at.text_area) == 2
+        if at.text_area:
+            # Cached geometry → generator picker and nine slots, two locked.
+            assert any(s.label == "Generator" for s in at.selectbox)
+            assert len(at.text_area) == 9
+            assert sum(t.disabled for t in at.text_area) == 2
+        else:
+            assert any(b.label == "Run scene analysis" for b in at.button)
     if page == "views/review.py" and any(Path(IMPL / "outputs" / "l4r_nlb" / "studio" / "runs").glob("*/run.json")):
         assert any(s.label == "Run" for s in at.selectbox)
 
@@ -71,3 +75,35 @@ def test_pages_without_selection_prompt_for_a_frame():
     at.switch_page("views/generate.py").run()
     _no_errors(at)
     assert any("Select a frame" in i.value for i in at.info)
+
+
+def _analysed() -> bool:
+    cache = IMPL / "outputs" / "l4r_nlb" / "studio" / "cache" / FRAME
+    return cache.is_dir() and any(cache.glob("*.npz"))
+
+
+@pytest.mark.skipif(not _analysed(), reason="scene geometry not cached for the test frame")
+def test_generate_page_switches_generators():
+    at = _app(FRAME)
+    at.switch_page("views/generate.py").run()
+    _no_errors(at)
+    picker = next(s for s in at.selectbox if s.label == "Generator")
+    assert len(picker.options) == 7
+
+    picker.set_value("sd15_controlnet").run()
+    _no_errors(at)
+    labels = {s.label for s in at.slider}
+    assert {"Strength", "Depth control", "Segmentation control"} <= labels
+    assert any(b.label.startswith("Load recommended preset") for b in at.button)
+    # Long slot prompts exceed CLIP's window: the page must say so.
+    assert any("CLIP tokens" in w.value for w in at.warning)
+
+    next(b for b in at.button if b.label.startswith("Load recommended preset")).click().run()
+    _no_errors(at)
+    assert any(t.label == "Negative prompt" for t in at.text_area)
+    assert not any("CLIP tokens" in w.value for w in at.warning)
+
+    next(s for s in at.selectbox if s.label == "Generator").set_value("qwen_image_edit").run()
+    _no_errors(at)
+    generate = next(b for b in at.button if b.label == "Generate")
+    assert generate.disabled

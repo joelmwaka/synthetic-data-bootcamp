@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import streamlit as st
+from aieng.syn_data.image.workflow import generators as gens
 from aieng.syn_data.image.workflow import night as wf
 from PIL import Image
 from studio.overlays import colourise, draw_overlay
@@ -117,10 +118,16 @@ with left:
         st.dataframe([crit["scores"]], hide_index=True)
     elif crit.get("error"):
         st.caption(f"VLM unscored: {crit['error'][:200]}")
-    with st.expander("Prompt"):
+    gen_spec = gens.GENERATORS.get(cand.generator)
+    st.markdown(f"**Generator:** {gen_spec.title if gen_spec else cand.generator}")
+    with st.expander("Prompt and generator settings"):
         st.write(cand.prompt)
+        if cand.negative_prompt:
+            st.caption(f"Negative: {cand.negative_prompt}")
         if cand.slots:
             st.json(cand.slots, expanded=False)
+        if cand.generator_params:
+            st.json(cand.generator_params, expanded=False)
 with right, st.form(f"review_{run_id}_{cand.candidate_id}"):
     st.markdown("**Label visibility at night**")
     new_flags = []

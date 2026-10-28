@@ -1193,6 +1193,7 @@ class MethodComparer:
         max_side = int(generation_cfg.get("vlm_max_side", self.vlm_max_side))
         size = str(generation_cfg.get("vlm_size", self.vlm_size))
         aspect = generation_cfg.get("vlm_aspect_ratio")
+        preamble = generation_cfg.get("vlm_edit_preamble")
 
         cfg = VlmGenerateConfig(
             model=model,
@@ -1203,6 +1204,7 @@ class MethodComparer:
             aspect_ratio=str(aspect) if aspect not in (None, "") else None,
             size=size,
             max_side=max_side,
+            edit_preamble=str(preamble) if preamble not in (None, "") else None,
         )
         seed_image = None if cfg.mode == "generate" else original
         generated = generate_with_vlm(prompt, seed_image=seed_image, config=cfg)
